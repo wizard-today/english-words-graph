@@ -1,383 +1,391 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
-import * as d3 from 'd3';
+import React, { useState, useEffect, useRef } from 'react';
 import { Api } from "./api";
 
-/* ════════════════════════════════════════════════
-   COLORS
-════════════════════════════════════════════════ */
-
-const COLORS = {
-  service: { fill: '#f0ecff', stroke: '#7c5cdb', text: '#5a4a9e' },
-  branch:  { fill: '#e0f5f0', stroke: '#0d8c6e', text: '#0a5d4a' },
-  leaf:    { fill: '#e8f3ff', stroke: '#1b72dc', text: '#0d4ba0' },
-};
-
-function getColor(node) {
-  if (node.isService) return COLORS.service;
-  if (node.hasNested) return COLORS.branch;
-  return COLORS.leaf;
-}
-
-function getRadius(nodeData, maxTotal) {
-  return 28 + (nodeData.total / maxTotal) * 20;
-}
-
-/* ════════════════════════════════════════════════
-   TREE DATA BUILDER
-════════════════════════════════════════════════ */
-
-function buildTreeData(categories, cards) {
-  const catMap = {};
-  categories.forEach(c => { catMap[c.id] = c; });
-
-  const cardsByCat = {};
-  cards.forEach(card => {
-    const cid = card.category?.id;
-    if (cid) cardsByCat[cid] = (cardsByCat[cid] || 0) + 1;
-  });
-
-  function countCards(id) {
-    const cat = catMap[id];
-    if (!cat) return 0;
-    let total = cardsByCat[id] || 0;
-    (cat.nested || []).forEach(n => { total += countCards(n.id); });
-    return total;
-  }
-
-  function buildNode(id) {
-    const cat       = catMap[id];
-    const direct    = cardsByCat[id] || 0;
-    const total     = countCards(id);
-    const hasNested = !!(cat && cat.nested && cat.nested.length > 0);
-
-    const node = { id, name: cat.short || cat.name, isService: false, direct, total, hasNested, children: [] };
-
-    if (hasNested && direct > 0) {
-      node.children.push({
-        id: `misc_${id}`, name: 'Прочее', isService: true,
-        direct, total: direct, hasNested: false, children: [],
-      });
-    }
-    (cat.nested || []).forEach(n => node.children.push(buildNode(n.id)));
+// ─── Build Tree from nested structure ────────────────────────────────────────
+function buildTree(cats) {
+  function processNode(cat) {
+    const node = {
+      ...cat,
+      _children: (cat.nested || []).map(processNode),
+    };
+    node._totalCards  = node.cards_count  + node._children.reduce((s, c) => s + c._totalCards,  0);
+    node._totalRepeat = node.repeat_cards_count + node._children.reduce((s, c) => s + c._totalRepeat, 0);
     return node;
   }
 
-  const roots = categories.filter(c => !c.parent);
+  const roots = cats.map(processNode);
   return {
-    id: 'v_all', name: 'Все', isService: true, isRoot: true,
-    direct: cards.length, total: cards.length, hasNested: true,
-    children: roots.map(r => buildNode(r.id)),
+    id: '__root__',
+    name: 'Все',
+    short_name: 'Все',
+    cards_count: 0,
+    repeat_cards_count: 0,
+    _children: roots,
+    _isRoot: true,
+    _totalCards:  roots.reduce((s, r) => s + r._totalCards,  0),
+    _totalRepeat: roots.reduce((s, r) => s + r._totalRepeat, 0),
   };
 }
 
-function countNodes(node) {
-  return 1 + (node.children || []).reduce((s, c) => s + countNodes(c), 0);
-}
-
-/* ════════════════════════════════════════════════
-   TEXT WRAP
-════════════════════════════════════════════════ */
-
-function wrapText(text = '', maxWidth, fontSize) {
-  const charW    = fontSize * 0.58;
-  const maxChars = Math.max(1, Math.floor(maxWidth / charW));
-  if (text.length <= maxChars) return [text];
-
-  const words = text.split(/\s+/);
-  const lines  = [];
-  let current  = '';
-  for (const word of words) {
-    const candidate = current ? `${current} ${word}` : word;
-    if (candidate.length <= maxChars) {
-      current = candidate;
-    } else {
-      if (current) lines.push(current);
-      current = word.length > maxChars ? word.slice(0, maxChars) : word;
-    }
+// ─── Layout ──────────────────────────────────────────────────────────────────
+function layoutTree(root) {
+  function leafCount(node) {
+    if (!node._children.length) return 1;
+    return node._children.reduce((s, c) => s + leafCount(c), 0);
   }
-  if (current) lines.push(current);
-  return lines.length ? lines : [text.slice(0, maxChars)];
+  function setLeaves(node) {
+    node._leaves = leafCount(node);
+    node._children.forEach(setLeaves);
+  }
+  setLeaves(root);
+
+  let maxTotal = 1;
+  function findMax(node) {
+    maxTotal = Math.max(maxTotal, node._totalCards);
+    node._children.forEach(findMax);
+  }
+  findMax(root);
+
+  function nodeRadius(node) {
+    if (node._isRoot) return 48;
+    return 22 + (node._totalCards / maxTotal) * 18;
+  }
+
+  const levelRings = [0, 160, 310, 450, 580];
+  const getLevelRing = (d) => levelRings[Math.min(d, levelRings.length - 1)];
+
+  function assignAngles(node, depth, startAngle, endAngle) {
+    node._depth = depth;
+    node._angle = (startAngle + endAngle) / 2;
+    node._ringR = getLevelRing(depth);
+    if (!node._children.length) return;
+
+    const totalLeaves = node._children.reduce((s, c) => s + c._leaves, 0);
+    const span = endAngle - startAngle;
+    let cursor = startAngle;
+
+    node._children.forEach(child => {
+      let childSpan = (child._leaves / totalLeaves) * span;
+      const childR   = nodeRadius(child);
+      const minArc   = (2 * childR + 18) / Math.max(getLevelRing(depth + 1), 1);
+      childSpan = Math.max(childSpan, minArc);
+      assignAngles(child, depth + 1, cursor, cursor + childSpan);
+      cursor += childSpan;
+    });
+  }
+
+  assignAngles(root, 0, 0, 2 * Math.PI);
+
+  function polarToXY(node) {
+    if (node._depth === 0) {
+      node._x = 0; node._y = 0;
+    } else {
+      const dr = node._ringR - node._parent._ringR;
+      node._x = node._parent._x + dr * Math.cos(node._angle);
+      node._y = node._parent._y + dr * Math.sin(node._angle);
+    }
+    node._r = nodeRadius(node);
+    node._children.forEach(c => { c._parent = node; polarToXY(c); });
+  }
+  root._parent = root;
+  polarToXY(root);
+
+  return { root, maxTotal };
 }
 
-/* ════════════════════════════════════════════════
-   SVG HELPERS
-════════════════════════════════════════════════ */
-
+// ─── SVG helper ──────────────────────────────────────────────────────────────
 const NS = 'http://www.w3.org/2000/svg';
-const el = (tag, attrs = {}) => {
+const svgEl = (tag, attrs = {}) => {
   const e = document.createElementNS(NS, tag);
   for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
   return e;
 };
 
-/* ════════════════════════════════════════════════
-   CANVAS COMPONENT  (proper React component)
-════════════════════════════════════════════════ */
+const COLORS = {
+  root: { fill: '#534AB7', stroke: '#3C3489', text: '#fff',    count: 'rgba(255,255,255,0.88)', repeat: '#a5f3d8' },
+  node: { fill: '#e8f2fc', stroke: '#2a7dc0', text: '#0c4278', count: '#1b62a4',                repeat: '#0a7a5a' },
+};
 
-const GraphCanvas = React.forwardRef(function GraphCanvas(
-  { treeRoot, onReady },
-  fwdRef
-) {
+// ─── Canvas ──────────────────────────────────────────────────────────────────
+const Canvas = React.forwardRef(({ treeData }, ref) => {
   const containerRef = useRef(null);
   const svgRef       = useRef(null);
-  const panZoom      = useRef({ x: 0, y: 0, k: 1 });
-  const initPZ       = useRef({ x: 0, y: 0, k: 1 }); // saved initial fit
-  const dragging     = useRef(false);
-  const dragPt       = useRef({ x: 0, y: 0 });
+  const viewState    = useRef({ x: 0, y: 0, k: 1 });
+  const initView     = useRef({ x: 0, y: 0, k: 1 });
   const [tooltip, setTooltip] = useState(null);
 
-  // expose resetView to parent via ref
-  React.useImperativeHandle(fwdRef, () => ({
-    resetView() {
-      panZoom.current = { ...initPZ.current };
-      applyT();
+  const applyTransform = () => {
+    const g = svgRef.current?.querySelector('g.root-g');
+    if (g) {
+      const { x, y, k } = viewState.current;
+      g.setAttribute('transform', `translate(${x},${y}) scale(${k})`);
+    }
+  };
+
+  React.useImperativeHandle(ref, () => ({
+    resetView: () => {
+      viewState.current = { ...initView.current };
+      applyTransform();
     },
   }));
 
-  const applyT = useCallback(() => {
-    const g = svgRef.current?.querySelector('g.root-g');
-    if (!g) return;
-    const { x, y, k } = panZoom.current;
-    g.setAttribute('transform', `translate(${x},${y}) scale(${k})`);
-  }, []);
-
-  /* ── Draw ──────────────────────────────────────────────────── */
+  // ── Draw ──────────────────────────────────────────────────────────────────
   useEffect(() => {
-    const container = containerRef.current;
-    const svg       = svgRef.current;
-    if (!container || !svg || !treeRoot) return;
+    if (!containerRef.current || !svgRef.current || !treeData) return;
+    const W = containerRef.current.clientWidth;
+    const H = containerRef.current.clientHeight;
+    const { root } = treeData;
 
-    const W = container.clientWidth;
-    const H = container.clientHeight;
+    const allNodes = [];
+    const collect = (n) => { allNodes.push(n); n._children.forEach(collect); };
+    collect(root);
 
-    const hierarchy = d3.hierarchy(treeRoot);
-    const maxTotal  = d3.max(hierarchy.descendants(), d => d.data.total) || 1;
-
-    /* ── Radial tree layout ──────────────────────────────────── */
-    // Step between depth levels: 2 * maxRadius + gap
-    const maxR     = getRadius({ total: maxTotal }, maxTotal);
-    const depthStep = maxR * 2 + 55; // ring spacing — compact but non-overlapping
-
-    // d3.tree in radial mode: x = angle [0, 2π], y = radius from root
-    d3.tree()
-      .size([2 * Math.PI, hierarchy.height * depthStep])
-      // give siblings more room than cousins to avoid sector crowding
-      .separation((a, b) => (a.parent === b.parent ? 1.2 : 2.0) / a.depth)(hierarchy);
-
-    // Convert polar → Cartesian (root sits at centre = 0,0)
-    hierarchy.each(d => {
-      const r     = d.y;                // d3.tree already scales by depthStep
-      const angle = d.x - Math.PI / 2; // start from top
-      d.cx = r * Math.cos(angle);
-      d.cy = r * Math.sin(angle);
-    });
-
-    /* ── Fit & centre ────────────────────────────────────────── */
+    // Bounding box
     let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
-    hierarchy.each(d => {
-      const r = getRadius(d.data, maxTotal);
-      x0 = Math.min(x0, d.cx - r);
-      x1 = Math.max(x1, d.cx + r);
-      y0 = Math.min(y0, d.cy - r);
-      y1 = Math.max(y1, d.cy + r);
+    allNodes.forEach(n => {
+      x0 = Math.min(x0, n._x - n._r - 4);
+      x1 = Math.max(x1, n._x + n._r + 4);
+      y0 = Math.min(y0, n._y - n._r - 4);
+      y1 = Math.max(y1, n._y + n._r + 4);
     });
 
-    const pad    = 60;
-    const cW     = x1 - x0 + pad * 2;
-    const cH     = y1 - y0 + pad * 2;
-    const kFit   = Math.min(W / cW, H / cH, 1.6);
-    const initX  = W / 2 - kFit * ((x0 + x1) / 2);
-    const initY  = H / 2 - kFit * ((y0 + y1) / 2);
+    const pad  = 50;
+    const kFit = Math.min(W / (x1 - x0 + pad * 2), H / (y1 - y0 + pad * 2), 1.4);
+    const ix   = W / 2 - kFit * ((x0 + x1) / 2);
+    const iy   = H / 2 - kFit * ((y0 + y1) / 2);
+    viewState.current = { x: ix, y: iy, k: kFit };
+    initView.current  = { ...viewState.current };
 
-    panZoom.current  = { x: initX, y: initY, k: kFit };
-    initPZ.current   = { x: initX, y: initY, k: kFit };
+    svgRef.current.innerHTML = '';
 
-    /* ── Build SVG ───────────────────────────────────────────── */
-    svg.setAttribute('width',  W);
-    svg.setAttribute('height', H);
-    svg.innerHTML = '';
-
-    const defs = el('defs');
+    // Defs
+    const defs = svgEl('defs');
     defs.innerHTML = `
-      <marker id="kg-arr" viewBox="0 0 10 10" refX="9" refY="5"
-              markerWidth="5" markerHeight="5" orient="auto-start-reverse">
-        <path d="M2 1L8 5L2 9" fill="none" stroke="#b0a8cc"
-              stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+      <filter id="shadow" x="-30%" y="-30%" width="160%" height="160%">
+        <feDropShadow dx="0" dy="1.5" stdDeviation="3" flood-color="rgba(0,0,0,0.10)"/>
+      </filter>
+      <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="4" markerHeight="4" orient="auto-start-reverse">
+        <path d="M2 2L8 5L2 8" fill="none" stroke="#9db8d6" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
       </marker>`;
-    svg.appendChild(defs);
+    svgRef.current.appendChild(defs);
 
-    const rootG = el('g', { class: 'root-g',
-      transform: `translate(${initX},${initY}) scale(${kFit})` });
-    svg.appendChild(rootG);
+    const g = svgEl('g', { class: 'root-g', transform: `translate(${ix},${iy}) scale(${kFit})` });
+    svgRef.current.appendChild(g);
 
-    /* ── Links ───────────────────────────────────────────────── */
-    const linkG = el('g', { fill: 'none' });
-    rootG.appendChild(linkG);
+    // Links
+    const linkG = svgEl('g', { fill: 'none' });
+    g.appendChild(linkG);
 
-    hierarchy.links().forEach(({ source: s, target: t }) => {
-      const sr  = getRadius(s.data, maxTotal);
-      const tr  = getRadius(t.data, maxTotal);
-      const dx  = t.cx - s.cx, dy = t.cy - s.cy;
+    allNodes.forEach(node => {
+      if (node._isRoot) return;
+      const par  = node._parent;
+      const dx   = node._x - par._x, dy = node._y - par._y;
       const dist = Math.sqrt(dx * dx + dy * dy);
-      if (dist === 0) return;
-
+      if (dist < 1) return;
       const ux = dx / dist, uy = dy / dist;
-      const x1 = s.cx + ux * (sr + 1);
-      const y1 = s.cy + uy * (sr + 1);
-      const x2 = t.cx - ux * (tr + 4);
-      const y2 = t.cy - uy * (tr + 4);
-
-      // Smooth cubic bezier for radial edges
-      const path = el('path', {
-        d:             `M${x1},${y1} C${x1 + ux * 40},${y1 + uy * 40} ${x2 - ux * 40},${y2 - uy * 40} ${x2},${y2}`,
-        stroke:        '#c5bfe0',
-        'stroke-width': '1.2',
-        'marker-end':  'url(#kg-arr)',
+      const x1 = par._x + ux * (par._r + 1),  y1 = par._y + uy * (par._r + 1);
+      const x2 = node._x - ux * (node._r + 5), y2 = node._y - uy * (node._r + 5);
+      const cx1 = x1 + ux * dist * 0.35, cy1 = y1 + uy * dist * 0.35;
+      const cx2 = x2 - ux * dist * 0.35, cy2 = y2 - uy * dist * 0.35;
+      const path = svgEl('path', {
+        d: `M${x1},${y1} C${cx1},${cy1} ${cx2},${cy2} ${x2},${y2}`,
+        stroke: '#c0d4e8', 'stroke-width': '1', 'marker-end': 'url(#arr)',
       });
       linkG.appendChild(path);
     });
 
-    /* ── Nodes ───────────────────────────────────────────────── */
-    const nodeG = el('g');
-    rootG.appendChild(nodeG);
+    // Nodes
+    const nodeG = svgEl('g');
+    g.appendChild(nodeG);
 
-    hierarchy.descendants().forEach(d => {
-      const r   = getRadius(d.data, maxTotal);
-      const col = getColor(d.data);
+    allNodes.forEach(node => {
+      const col = node._isRoot ? COLORS.root : COLORS.node;
+      const r   = node._r;
 
-      const g = el('g', { transform: `translate(${d.cx},${d.cy})` });
-      g.style.cursor = 'pointer';
+      const ng = svgEl('g', { class: 'node-group', transform: `translate(${node._x},${node._y})` });
+      ng.style.cursor = 'pointer';
 
-      // Subtle halo
-      const halo = el('circle', { r: r + 3, fill: col.stroke, opacity: '0.08' });
-      g.appendChild(halo);
-
-      // Main circle
-      const circle = el('circle', {
-        r, fill: col.fill, stroke: col.stroke, 'stroke-width': '1.5',
-      });
-      g.appendChild(circle);
-
-      // ── Label (name) ─────────────────────────────────────────
-      // Reserve bottom portion for count number
-      const countFontSize = Math.max(11, r * 0.42);
-      const nameFontSize  = Math.max(9,  Math.min(12, r * 0.32));
-      const countH        = d.data.total > 0 ? countFontSize * 1.3 : 0;
-      const nameAreaH     = r * 2 - countH - 10; // vertical space for name
-      const nameAreaW     = r * 1.3;             // chord width at 65% radius
-
-      const lines  = wrapText(d.data.name, nameAreaW, nameFontSize);
-      const lineH  = nameFontSize * 1.28;
-      const totalH = lines.length * lineH + countH;
-      // Centre the whole block (name + count) vertically
-      const blockTop = -totalH / 2 + lineH * 0.5;
-
-      lines.forEach((line, i) => {
-        const txt = el('text', {
-          x: '0', y: blockTop + i * lineH,
-          'text-anchor': 'middle', 'dominant-baseline': 'central',
-          'font-size': nameFontSize, 'font-weight': '500',
-          fill: col.text, 'pointer-events': 'none',
-        });
-        txt.textContent = line;
-        g.appendChild(txt);
-      });
-
-      // ── Count number (large, below name) ─────────────────────
-      if (d.data.total > 0) {
-        const countY = blockTop + lines.length * lineH;
-        const countTxt = el('text', {
-          x: '0', y: countY,
-          'text-anchor': 'middle', 'dominant-baseline': 'central',
-          'font-size': countFontSize, 'font-weight': '700',
-          fill: col.stroke, 'pointer-events': 'none',
-        });
-        countTxt.textContent = d.data.total;
-        g.appendChild(countTxt);
+      if (node._isRoot) {
+        const halo = svgEl('circle', { r: r + 8, fill: '#534AB7', opacity: '0.15' });
+        ng.appendChild(halo);
       }
 
-      /* ── Tooltip ─────────────────────────────────────────────── */
-      g.addEventListener('mouseenter', ev => {
-        const rect = container.getBoundingClientRect();
-        setTooltip({ x: ev.clientX - rect.left, y: ev.clientY - rect.top, node: d.data });
-        circle.setAttribute('stroke-width', '2.5');
+      const circle = svgEl('circle', {
+        r, fill: col.fill, stroke: col.stroke,
+        'stroke-width': node._isRoot ? '2' : '1.2',
+        ...(node._isRoot ? { filter: 'url(#shadow)' } : {}),
       });
-      g.addEventListener('mouseleave', () => {
+      ng.appendChild(circle);
+
+      // ── Text layout: repeat (top) · name · count (bottom) ──────────────────
+      // Row height = fontSize only (no multiplier) so virtual boxes match real
+      // glyph height. dominant-baseline:middle centres each glyph at its y.
+
+      const countFontSize  = node._isRoot ? 22 : Math.max(10, Math.min(15, r * 0.38));
+      const nameFontSize   = Math.max(8,  Math.min(11.5, r * 0.26));
+      const repeatFontSize = node._isRoot ? 14 : Math.max(8, Math.min(10, r * 0.22));
+      const GAP = 3;
+
+      const rowDefs = [];
+      // Always reserve space for repeat row (empty if zero) to keep text centring consistent
+      // rowDefs.push({ text: node._totalRepeat > 0 ? String(node._totalRepeat) : '', fs: repeatFontSize, fw: '500', fill: col.repeat });
+      if (node._totalRepeat > 0) {
+        rowDefs.push({ text: String(node._totalRepeat), fs: repeatFontSize, fw: '500', fill: col.repeat });
+      }
+      if (!node._isRoot) {
+        const label = node.short_name || node.name || '';
+        label.split(' ').forEach(line => {
+          rowDefs.push({ text: line, fs: nameFontSize, fw: '500', fill: col.text });
+        });
+      }
+      // if (node._totalCards > 0) {
+        rowDefs.push({ text: String(node._totalCards), fs: countFontSize, fw: '700', fill: col.count });
+      // }
+
+      // Total height = sum of font sizes + gaps
+      const totalH = rowDefs.reduce((s, row) => s + row.fs, 0) + GAP * (rowDefs.length - 1);
+      let y = -totalH / 2;
+
+      rowDefs.forEach((row, idx) => {
+        const text = svgEl('text', {
+          x: 0,
+          y: 0,
+          'text-anchor': 'middle',
+          'dominant-baseline': 'middle',
+          'pointer-events': 'none',
+        });
+
+        const totalH =
+          rowDefs.reduce((s, r) => s + r.fs, 0) +
+          GAP * (rowDefs.length - 1);
+
+        let offset = -totalH / 2;
+
+        rowDefs.forEach((row, i) => {
+          const tspan = svgEl('tspan', {
+            x: 0,
+            dy: i === 0
+              ? offset + row.fs / 2
+              : GAP + row.fs,
+            'font-size': row.fs,
+            'font-weight': row.fw,
+            fill: row.fill,
+          });
+
+          tspan.textContent = row.text;
+          text.appendChild(tspan);
+        });
+
+        ng.appendChild(text);
+        y += row.fs + GAP;
+      });
+
+      // Hover
+      ng.addEventListener('mouseenter', () => {
+        setTooltip(node);
+        circle.setAttribute('stroke-width', node._isRoot ? '3' : '2');
+      });
+      ng.addEventListener('mouseleave', () => {
         setTooltip(null);
-        circle.setAttribute('stroke-width', '1.5');
+        circle.setAttribute('stroke-width', node._isRoot ? '2' : '1.2');
       });
 
-      nodeG.appendChild(g);
+      nodeG.appendChild(ng);
     });
+  }, [treeData]);
 
-    onReady?.();
-  }, [treeRoot, applyT, onReady]);
-
-  /* ── Pan & Zoom (attached once, container always present) ───── */
+  // ── Pan & Zoom ─────────────────────────────────────────────────────────────
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
 
-    const onWheel = e => {
-      e.preventDefault();
-      const factor = e.deltaY < 0 ? 1.12 : 0.89;
-      const rect   = container.getBoundingClientRect();
-      const mx     = e.clientX - rect.left;
-      const my     = e.clientY - rect.top;
-      const pz     = panZoom.current;
-      pz.x  = mx - (mx - pz.x) * factor;
-      pz.y  = my - (my - pz.y) * factor;
-      pz.k *= factor;
-      applyT();
-    };
+    let dragging = false, dragPt = { x: 0, y: 0 };
 
-    const onDown = e => {
+    const onWheel = (e) => {
+      e.preventDefault();
+      const f    = e.deltaY < 0 ? 1.1 : 0.91;
+      const rect = container.getBoundingClientRect();
+      const mx   = e.clientX - rect.left, my = e.clientY - rect.top;
+      viewState.current.x = mx - (mx - viewState.current.x) * f;
+      viewState.current.y = my - (my - viewState.current.y) * f;
+      viewState.current.k *= f;
+      applyTransform();
+    };
+    const onDown = (e) => {
       if (e.button !== 0) return;
-      dragging.current = true;
-      dragPt.current   = { x: e.clientX, y: e.clientY };
+      dragging = true; dragPt = { x: e.clientX, y: e.clientY };
       container.style.cursor = 'grabbing';
     };
-
-    const onMove = e => {
-      if (!dragging.current) return;
-      const pz = panZoom.current;
-      pz.x += e.clientX - dragPt.current.x;
-      pz.y += e.clientY - dragPt.current.y;
-      dragPt.current = { x: e.clientX, y: e.clientY };
-      applyT();
+    const onMove = (e) => {
+      if (!dragging) return;
+      viewState.current.x += e.clientX - dragPt.x;
+      viewState.current.y += e.clientY - dragPt.y;
+      dragPt = { x: e.clientX, y: e.clientY };
+      applyTransform();
     };
+    const onUp = () => { dragging = false; container.style.cursor = 'grab'; };
 
-    const onUp = () => {
-      dragging.current = false;
-      container.style.cursor = 'grab';
-    };
-
-    // wheel: passive:false so we can preventDefault (needed in Chrome)
-    container.addEventListener('wheel',     onWheel, { passive: false });
+    container.addEventListener('wheel', onWheel, { passive: false });
     container.addEventListener('mousedown', onDown);
-    window.addEventListener('mousemove',    onMove);
-    window.addEventListener('mouseup',      onUp);
-
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
     return () => {
-      container.removeEventListener('wheel',     onWheel);
+      container.removeEventListener('wheel', onWheel);
       container.removeEventListener('mousedown', onDown);
-      window.removeEventListener('mousemove',    onMove);
-      window.removeEventListener('mouseup',      onUp);
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
     };
-  }, [applyT]); // applyT is stable (useCallback with [])
+  }, []);
 
   return (
-    <div ref={containerRef} style={styles.canvas}>
-      <svg ref={svgRef} style={{ display: 'block' }} />
-      {tooltip && <Tooltip tooltip={tooltip} container={containerRef.current} />}
+    <div ref={containerRef} style={{ flex: 1, position: 'relative', overflow: 'hidden', cursor: 'grab', background: '#f5f4f0' }}>
+      <svg ref={svgRef} style={{ display: 'block', width: '100%', height: '100%' }} />
+      {tooltip && <Tooltip node={tooltip} container={containerRef.current} />}
     </div>
   );
 });
 
-/* ════════════════════════════════════════════════
-   APP
-════════════════════════════════════════════════ */
+// ─── Tooltip ─────────────────────────────────────────────────────────────────
+function Tooltip({ node, container }) {
+  const [pos, setPos] = useState({ x: -999, y: -999 });
 
+  useEffect(() => {
+    const onMove = (e) => {
+      if (!container) return;
+      const rect = container.getBoundingClientRect();
+      const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+      const W = container.clientWidth, H = container.clientHeight;
+      const TW = 200, TH = 100, PAD = 14;
+      let tx = mx + PAD, ty = my - 10;
+      if (tx + TW > W) tx = mx - TW - PAD;
+      if (ty + TH > H) ty = my - TH;
+      setPos({ x: tx, y: ty });
+    };
+    window.addEventListener('mousemove', onMove);
+    return () => window.removeEventListener('mousemove', onMove);
+  }, [container]);
+
+  return (
+    <div style={{
+      position: 'absolute', left: pos.x, top: pos.y,
+      pointerEvents: 'none', background: '#fff',
+      border: '0.5px solid rgba(0,0,0,0.15)', borderRadius: '8px',
+      padding: '9px 13px', fontSize: '12px',
+      boxShadow: '0 6px 20px rgba(0,0,0,0.09)', maxWidth: '200px', zIndex: 1000,
+    }}>
+      <div style={{ fontWeight: 500, fontSize: '13px', marginBottom: '4px', color: '#111' }}>{node.name}</div>
+      <div style={{ color: '#555', lineHeight: 1.6 }}>Всего карточек: <b>{node._totalCards}</b></div>
+      {node._totalRepeat > 0 && (
+        <div style={{ color: '#0a7a5a', fontWeight: 500, lineHeight: 1.6 }}>К повторению: {node._totalRepeat}</div>
+      )}
+      {node._children.length > 0 && (
+        <div style={{ color: '#888', lineHeight: 1.6, fontSize: '11px' }}>Подкатегорий: {node._children.length}</div>
+      )}
+    </div>
+  );
+}
+
+// ─── App ─────────────────────────────────────────────────────────────────────
 export default function App() {
   const [data,    setData]    = useState(null);
   const [loading, setLoading] = useState(true);
@@ -385,119 +393,51 @@ export default function App() {
 
   useEffect(() => {
     (async () => {
-      const api = new Api();
-      const [cats, cards] = await Promise.all([api.getCategories(), api.getCards()]);
-      setData({ treeRoot: buildTreeData(cats, cards), catCount: cats.length, cardCount: cards.length });
+      const api  = new Api();
+      const cats = await api.getCategories();
+      const root = buildTree(cats);
+      const treeData = layoutTree(root);
+      const allNodes = [];
+      const collect  = (n) => { allNodes.push(n); n._children.forEach(collect); };
+      collect(root);
+      setData({ treeData, root, nodeCount: allNodes.length });
       setLoading(false);
     })();
   }, []);
 
-  if (loading) return <div style={styles.loader}>Загрузка графа…</div>;
+  if (loading) {
+    return (
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100vh', fontSize: '16px', color: '#666' }}>
+        Загрузка графа…
+      </div>
+    );
+  }
 
   return (
-    <div style={styles.app}>
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', fontFamily: 'system-ui, -apple-system, sans-serif', userSelect: 'none' }}>
       {/* Toolbar */}
-      <div style={styles.toolbar}>
-        <span style={styles.stats}>
-          {countNodes(data.treeRoot)} узлов · {data.cardCount} карточек · {data.catCount} категорий
+      <div style={{
+        display: 'flex', alignItems: 'center', gap: '12px',
+        padding: '8px 14px', background: '#fff',
+        borderBottom: '0.5px solid rgba(0,0,0,0.12)', flexShrink: 0,
+      }}>
+        <span style={{ flex: 1, fontSize: '11px', color: '#666' }}>
+          {data?.nodeCount} категорий · {data?.root._totalCards} карточек · {data?.root._totalRepeat} готовых к повторению
         </span>
-        <button style={styles.btn} onClick={() => canvasRef.current?.resetView()}>
+        <button
+          onClick={() => canvasRef.current?.resetView()}
+          style={{
+            fontSize: '11px', padding: '4px 10px', borderRadius: '6px',
+            border: '0.5px solid rgba(0,0,0,0.2)', background: '#f5f5f5',
+            color: '#444', cursor: 'pointer',
+          }}
+        >
           Сбросить вид
         </button>
       </div>
 
       {/* Graph */}
-      <GraphCanvas ref={canvasRef} treeRoot={data.treeRoot} />
-
-      {/* Legend */}
-      <div style={styles.legend}>
-        <LegendItem color={COLORS.service} label="Служебный узел" />
-        <LegendItem color={COLORS.branch}  label="С подкатегориями" />
-        <LegendItem color={COLORS.leaf}    label="Конечная категория" />
-        <span style={{ marginLeft: 'auto', color: '#999', fontSize: 11 }}>
-          Колёсико — масштаб · Перетаскивание — сдвиг
-        </span>
-      </div>
+      <Canvas ref={canvasRef} treeData={data?.treeData} />
     </div>
   );
 }
-
-/* ════════════════════════════════════════════════
-   TOOLTIP
-════════════════════════════════════════════════ */
-
-function Tooltip({ tooltip, container }) {
-  const PAD = 14, TW = 190;
-  const cW  = container?.clientWidth  || 800;
-  const cH  = container?.clientHeight || 500;
-  let tx = tooltip.x + PAD;
-  let ty = tooltip.y - 10;
-  if (tx + TW > cW) tx = tooltip.x - TW - PAD;
-  if (ty + 115 > cH) ty = tooltip.y - 115;
-
-  const { node } = tooltip;
-  return (
-    <div style={{ ...styles.tooltip, left: tx, top: ty }}>
-      <div style={styles.ttTitle}>{node.name}</div>
-      <div style={styles.ttRow}>Карточек: <b>{node.total}</b></div>
-      {!node.isService && <div style={styles.ttRow}>Напрямую: <b>{node.direct}</b></div>}
-      {node.hasNested    && <div style={styles.ttRow}>Содержит подкатегории</div>}
-    </div>
-  );
-}
-
-function LegendItem({ color, label }) {
-  return (
-    <div style={styles.legendItem}>
-      <div style={{ width: 10, height: 10, borderRadius: '50%', flexShrink: 0,
-        background: color.fill, border: `1px solid ${color.stroke}` }} />
-      <span>{label}</span>
-    </div>
-  );
-}
-
-/* ════════════════════════════════════════════════
-   STYLES
-════════════════════════════════════════════════ */
-
-const styles = {
-  app: {
-    display: 'flex', flexDirection: 'column', height: '100vh',
-    fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
-    userSelect: 'none',
-  },
-  loader: {
-    display: 'flex', alignItems: 'center', justifyContent: 'center',
-    height: '100vh', fontSize: 16, color: '#666',
-  },
-  toolbar: {
-    display: 'flex', alignItems: 'center', gap: 10,
-    padding: '9px 14px', background: '#fff',
-    borderBottom: '1px solid #ebebeb',
-    boxShadow: '0 1px 3px rgba(0,0,0,0.04)', flexShrink: 0,
-  },
-  stats: { flex: 1, fontSize: 12, color: '#777' },
-  btn: {
-    padding: '5px 11px', fontSize: 12, background: '#f5f5f5',
-    border: '1px solid #e0e0e0', borderRadius: 6,
-    cursor: 'pointer', color: '#333',
-  },
-  canvas: {
-    flex: 1, overflow: 'hidden', position: 'relative',
-    background: '#f8f9fb', cursor: 'grab',
-  },
-  tooltip: {
-    position: 'absolute', pointerEvents: 'none', background: '#fff',
-    border: '1px solid #e5e5e5', borderRadius: 8, padding: '8px 12px',
-    fontSize: 12, boxShadow: '0 4px 16px rgba(0,0,0,0.08)', maxWidth: 190, zIndex: 1000,
-  },
-  ttTitle: { fontWeight: 600, fontSize: 13, marginBottom: 4, color: '#111' },
-  ttRow:   { color: '#555', lineHeight: 1.6 },
-  legend: {
-    display: 'flex', alignItems: 'center', gap: 18,
-    padding: '8px 14px', background: '#fff',
-    borderTop: '1px solid #ebebeb', fontSize: 11, color: '#666',
-    flexShrink: 0, flexWrap: 'wrap',
-  },
-  legendItem: { display: 'flex', alignItems: 'center', gap: 5 },
-};
