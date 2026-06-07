@@ -1,4 +1,4 @@
-const API_BASE = "https://words-notion-server-fwfr2c1bk6re.wizard-today.deno.net";
+const API_BASE = "https://words-notion-server.wizard-today.deno.net/";
 
 async function apiFetch(path, { method = "GET", body } = {}) {
   const res = await fetch(`${API_BASE}${path}`, {
